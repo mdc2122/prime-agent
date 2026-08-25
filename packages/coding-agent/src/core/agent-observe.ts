@@ -18,6 +18,15 @@ export interface AgentObserveAgentSummary {
 	messageCount: number;
 	queuedCount: number;
 	isSessionActive: boolean;
+	/** Live metadata for each in-flight tool call (name + start time). */
+	pendingToolCalls?: {
+		toolCallId: string;
+		toolName: string;
+		startedAt: number;
+	}[];
+	pendingToolCallCount?: number;
+	oldestToolCallStartedAt?: number;
+	oldestToolCallElapsedMs?: number;
 	parentActiveSessionId?: string;
 	parentSessionId?: string;
 	rlmChildId?: string;

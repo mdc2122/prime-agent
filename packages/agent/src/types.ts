@@ -324,6 +324,11 @@ export interface AgentState {
 	readonly streamingMessage?: AgentMessage;
 	/** Tool-call IDs currently executing. */
 	readonly pendingToolCalls: ReadonlySet<string>;
+	/**
+	 * Start time and tool name for each in-flight tool call, when the runtime
+	 * provides it. Optional for compatibility with external AgentState fixtures.
+	 */
+	readonly pendingToolCallMeta?: ReadonlyMap<string, { toolName: string; startedAt: number }>;
 	/** Error from the most recent failed or aborted assistant turn, if any. */
 	readonly errorMessage?: string;
 }

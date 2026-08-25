@@ -55,6 +55,12 @@ export interface SessionSummary {
 	hasRunningRlmChildren?: boolean;
 	/** True while the agent is streaming with tool calls pending; drives the "running tools" label. */
 	isRunningTools?: boolean;
+	/** Live metadata for each in-flight tool call (name + start time). */
+	pendingToolCalls?: {
+		toolCallId: string;
+		toolName: string;
+		startedAt: number;
+	}[];
 	attachedClients: number;
 	messageCount: number;
 	unfinishedActionCount?: number;
@@ -233,6 +239,13 @@ export function summaryForActiveSession(
 		isBashRunning: session.isBashRunning,
 		hasRunningRlmChildren: session.hasRunningRlmChildren(),
 		isRunningTools: session.isStreaming && session.state.pendingToolCalls.size > 0,
+		pendingToolCalls: [
+			...(session.state.pendingToolCallMeta ?? new Map<string, { toolName: string; startedAt: number }>()).entries(),
+		].map(([toolCallId, meta]) => ({
+			toolCallId,
+			toolName: meta.toolName,
+			startedAt: meta.startedAt,
+		})),
 		attachedClients: activeSession.clients.size,
 		messageCount: session.messages.length,
 		unfinishedActionCount: session.unfinishedActionCount,

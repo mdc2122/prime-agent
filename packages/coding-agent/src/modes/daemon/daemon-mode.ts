@@ -3257,6 +3257,17 @@ export class AgentDaemon {
 					: state.clients.size > 0
 						? "user"
 						: "idle";
+		const pendingToolCalls = [
+			...(session.state.pendingToolCallMeta ?? new Map<string, { toolName: string; startedAt: number }>()).entries(),
+		].map(([toolCallId, meta]) => ({
+			toolCallId,
+			toolName: meta.toolName,
+			startedAt: meta.startedAt,
+		}));
+		const oldestToolCallStartedAt =
+			pendingToolCalls.length > 0 ? Math.min(...pendingToolCalls.map((tool) => tool.startedAt)) : undefined;
+		const oldestToolCallElapsedMs =
+			oldestToolCallStartedAt !== undefined ? Date.now() - oldestToolCallStartedAt : undefined;
 		return {
 			activeSessionId: state.activeSessionId,
 			sessionId: summary.sessionId,
@@ -3271,6 +3282,10 @@ export class AgentDaemon {
 			messageCount: summary.messageCount,
 			queuedCount: summary.sessionActions.queuedCount,
 			isSessionActive: summary.isSessionActive,
+			pendingToolCalls,
+			pendingToolCallCount: pendingToolCalls.length,
+			...(oldestToolCallStartedAt !== undefined ? { oldestToolCallStartedAt } : {}),
+			...(oldestToolCallElapsedMs !== undefined ? { oldestToolCallElapsedMs } : {}),
 			...(summary.parentActiveSessionId ? { parentActiveSessionId: summary.parentActiveSessionId } : {}),
 			...(summary.parentSessionId ? { parentSessionId: summary.parentSessionId } : {}),
 			...(summary.rlmChildId ? { rlmChildId: summary.rlmChildId } : {}),
