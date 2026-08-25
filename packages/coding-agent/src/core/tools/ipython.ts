@@ -261,6 +261,12 @@ export interface IpythonToolDetails {
 	sentAgentMessages?: KernelSentAgentMessage[];
 	/** True when this result came after killing and restarting a busy kernel. */
 	kernelRestarted?: boolean;
+	/** Stream identity for live partial updates ("stdout" | "stderr"). */
+	stream?: "stdout" | "stderr";
+	/** Whether a partial update is a delta or an accumulated snapshot. */
+	updateMode?: "delta" | "snapshot";
+	/** Marks a partial update as an ipython stream chunk. */
+	traceKind?: "ipython_stream";
 	error?: {
 		ename: string;
 		evalue: string;
@@ -661,10 +667,15 @@ export function createIpythonToolDefinition(
 					toolCallId,
 					code,
 					signal,
-					(chunk) => {
+					(chunk, stream) => {
 						onUpdate?.({
 							content: [{ type: "text", text: chunk }],
-							details: { status: "ok" },
+							details: {
+								status: "ok",
+								stream,
+								updateMode: "delta",
+								traceKind: "ipython_stream",
+							},
 						});
 					},
 					setToolWorkingMessage,
