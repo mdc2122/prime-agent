@@ -1383,6 +1383,14 @@ export interface ExtensionRuntimeState {
 	 * process.env. Returns undefined to use the parent env unchanged.
 	 */
 	getExecEnv?: () => Record<string, string | undefined> | undefined;
+	/**
+	 * Session id owning the pi-surface kernel/trace bindings
+	 * (getIpythonKernel, recordToolExecution). The runtime object can be
+	 * shared across sessions from one ResourceLoader (inline RLM children);
+	 * only the owning session may rebind, so a child spawn cannot repoint
+	 * the parent's kernel onto its own.
+	 */
+	ipythonBindingOwnerSessionId?: string;
 	/** Provider registrations queued during extension loading, processed when runner binds */
 	pendingProviderRegistrations: Array<{ name: string; config: ProviderConfig; extensionPath: string }>;
 	/** Throws when this extension instance is stale after runtime replacement. */

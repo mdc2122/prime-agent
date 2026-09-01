@@ -314,11 +314,25 @@ export class ExtensionRunner {
 		// exposed on both ctx (via getIpythonKernelFn) and pi (via the runtime
 		// action) so either surface can reach the agent's own kernel.
 		this.getIpythonKernelFn = actions.getIpythonKernel ?? (() => undefined);
-		this.runtime.getIpythonKernel = this.getIpythonKernelFn;
 		// Extension-driven tool executions replay as native tool_execution_*
 		// events; hosts that do not bind the action drop them silently.
 		this.recordToolExecutionFn = actions.recordToolExecution ?? (() => {});
-		this.runtime.recordToolExecution = this.recordToolExecutionFn;
+		// The runtime object can be shared across sessions from one
+		// ResourceLoader (inline RLM children). The first session to bind owns
+		// the pi-surface kernel/trace accessors; a child session binding later
+		// must not repoint the parent's kernel onto its own ("last bind wins"
+		// was the notes/706 kernel hijack). Rebinds by the owning session
+		// (/reload rebuilds the runner) still refresh. ctx.* access stays
+		// per-session via the runner Fn fields above.
+		const bindingSessionId = this.sessionManager.getSessionId();
+		if (
+			this.runtime.ipythonBindingOwnerSessionId === undefined ||
+			this.runtime.ipythonBindingOwnerSessionId === bindingSessionId
+		) {
+			this.runtime.ipythonBindingOwnerSessionId = bindingSessionId;
+			this.runtime.getIpythonKernel = this.getIpythonKernelFn;
+			this.runtime.recordToolExecution = this.recordToolExecutionFn;
+		}
 
 		for (const { name, config, extensionPath } of this.runtime.pendingProviderRegistrations) {
 			try {
