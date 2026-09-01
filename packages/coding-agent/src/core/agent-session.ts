@@ -738,6 +738,52 @@ function visibleSessionActionProjection(actions: readonly QueuedSessionAction[])
 
 const IPYTHON_SENT_AGENT_MESSAGE_CUSTOM_ENTRY = "ipython_sent_agent_message";
 
+/**
+ * Zero-spawn guard notice (2026-09-01 phantom-delegation hang: a root ended
+ * its turn deferring synthesis to "four independent reviews" it had narrated
+ * but never spawned — zero rlm children existed, so nothing could ever wake
+ * the parked session; only user input or a real child reply resumes it).
+ */
+const ZERO_SPAWN_GUARD_NOTICE =
+	"[zero-spawn guard] No live subagent sessions exist (rlm.list_subagents() is empty), " +
+	"but your last message defers work to their results. No reply will ever arrive. " +
+	"Either spawn the subagents now (await rlm(...)) or complete the deferred work yourself.";
+
+/** True when assistant text defers completion to results from child agents. */
+export function referencesPendingChildWork(content: AssistantMessage["content"]): boolean {
+	let text = "";
+	for (const block of content) {
+		if (block.type === "text") text += `\n${block.text}`;
+	}
+	if (text.length > 4000) text = text.slice(0, 4000);
+	return (
+		// "I'll synthesize the four reviews when they return."
+		/\bwhen\s+(?:they|the|these|those|my|our|all)\b[^\n]{0,60}?\b(?:return|finish|complete|report|reply|come back)\b/i.test(
+			text,
+		) ||
+		// "...once the independent reviews finish."
+		/\bonce\s+(?:the|these|those|my|our|all)\b[^\n]{0,60}?\b(?:finish(?:es)?|complete|return|report|reply)\b/i.test(
+			text,
+		) ||
+		// "the reviewers/subagents/workers will report back"
+		/\b(?:subagents?|sub-agents?|workers?|reviewers?|child(?:ren)?(?:\s+agents?)?)\b[^\n]{0,80}?\b(?:return|reply|report|finish|complete)\b/i.test(
+			text,
+		) ||
+		// "waiting for the reviews/replies/results"
+		/\bwaiting\s+(?:for|on)\b[^\n]{0,60}?\b(?:reviews?|reports?|replies|results?|workers?|subagents?|children)\b/i.test(
+			text,
+		) ||
+		// "I'll combine those once the reports land" / "... after the reviews finish"
+		/\bI(?:'ll|\s+will)\s+(?:synthesize|combine|merge|compile|collect|finalize)\b[^\n]{0,100}?\b(?:when|once|after)\b/i.test(
+			text,
+		) ||
+		// "when the reviews return" (reversed order)
+		/\b(?:when|once)\b[^\n]{0,40}?\b(?:reviews?|reports?|results?|replies|workers?|subagents?|children)\b[^\n]{0,20}?\b(?:return|finish|complete|arrive)\b/i.test(
+			text,
+		)
+	);
+}
+
 interface PersistedIpythonSentAgentMessage {
 	toolCallId: string;
 	message: KernelSentAgentMessage;
@@ -1165,6 +1211,8 @@ export class AgentSession {
 	// Inline mode keeps finished child sessions so the inspector can still read them;
 	// the daemon does the same by leaving the child session resident in its registry.
 	private _rlmChildSessions = new Map<string, AgentSession>();
+	/** One-shot latch for the zero-spawn guard; reset on each user prompt (_prompt). */
+	private _zeroSpawnGuardFired = false;
 	private _deletedRlmChildIds = new Set<string>();
 	// Failed explicit deletes stay hidden from listings but retain their original
 	// selector so a later delete can retry cleanup without orphaning the runtime.
@@ -2243,6 +2291,11 @@ export class AgentSession {
 		} catch {
 			// Goal accounting must not interrupt the core agent loop.
 		}
+		try {
+			await this._maybeFireZeroSpawnGuard(context.message);
+		} catch {
+			// The guard must never interrupt the core agent loop either.
+		}
 		// Serialized refine checkpoint: in print/headless mode, run refinement
 		// planning+apply synchronously here — the quiescent boundary between
 		// turns — so it never overlaps the primary model request.
@@ -2273,6 +2326,28 @@ export class AgentSession {
 		// A queued continuation disproves the assistant-last "task finished" heuristic, so preserve a true set above.
 		this._continueAfterThresholdCompaction ||= lastMessage !== undefined && lastMessage.role !== "assistant";
 		return true;
+	}
+
+	/**
+	 * Zero-spawn guard: a root session whose final assistant message defers
+	 * work to subagent results, while the RLM registry holds no live child
+	 * sessions, is parked on replies that can never arrive (nothing but user
+	 * input or a real child reply resumes it). Queue an internal steer prompt
+	 * that states the fact and resumes the idle session — the same
+	 * resumeIfIdle path goal budget steering uses. One shot per user prompt:
+	 * the latch resets in _prompt, so a model that parks again cannot loop
+	 * the guard. Disabled with PRIME_AGENT_ZERO_SPAWN_GUARD=0.
+	 */
+	private async _maybeFireZeroSpawnGuard(message: AssistantMessage): Promise<void> {
+		if (process.env.PRIME_AGENT_ZERO_SPAWN_GUARD === "0") return;
+		if (this._rlmDepth !== 0) return;
+		if (this._zeroSpawnGuardFired) return;
+		if (!message || message.role !== "assistant" || !referencesPendingChildWork(message.content)) return;
+		if (this._rlmChildSessionSnapshot().length > 0) return;
+		this._zeroSpawnGuardFired = true;
+		await this._queuePreparedPrompt("steer", ZERO_SPAWN_GUARD_NOTICE, undefined, {
+			resumeIfIdle: true,
+		});
 	}
 
 	/**
@@ -4841,6 +4916,8 @@ export class AgentSession {
 	}
 
 	private async _prompt(text: string, options?: InternalPromptOptions): Promise<void> {
+		// A new user prompt re-arms the zero-spawn guard for the next turn.
+		this._zeroSpawnGuardFired = false;
 		const resumeSuspendedInput = options?.resumeIfIdle !== false;
 		if (!this.isStreaming) {
 			if (resumeSuspendedInput) this._resumeSessionInputAdmission();
