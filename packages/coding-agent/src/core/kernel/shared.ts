@@ -109,6 +109,14 @@ export function assertHostRequestHandler(value: unknown): asserts value is HostR
 /** Host request handlers keyed by request type (e.g. "rlm.run", "goal.complete"). */
 export type HostRequestHandlers = Record<string, HostRequestHandler>;
 
+/**
+ * Lazily resolves the host handlers of a session other than the kernel's
+ * provisioning owner. Returns undefined once that session is gone (disposed /
+ * garbage-collected), in which case dispatch falls back to the owner's
+ * handlers — the pre-registration behavior.
+ */
+export type SessionHostHandlersProvider = () => HostRequestHandlers | undefined;
+
 /** Where and how to persist the kernel's user namespace so it survives resume. */
 export interface KernelSnapshotConfig {
 	/** Absolute path for the dill payload. */
@@ -130,6 +138,16 @@ export interface KernelManagerOptions {
 	env?: Record<string, string>;
 	sessionId?: string;
 	hostHandlers?: HostRequestHandlers;
+	/**
+	 * Live registry of OTHER sessions allowed to execute on this kernel (shared
+	 * kernels: rlm children on the kernel-fulfill path). When an execution is
+	 * tagged with an {@link ExecuteOptions.ownerSessionId} found here, host
+	 * requests raised by that execution dispatch to that session's handlers
+	 * instead of the provisioning session's — so e.g. agent_message.send goes
+	 * out under the child's identity, not the kernel owner's. The map is shared
+	 * by reference; registrations made after kernel start are visible.
+	 */
+	sessionHostHandlers?: ReadonlyMap<string, SessionHostHandlersProvider>;
 	pythonSkills?: readonly KernelPythonSkill[];
 	/** Persist/revive the user namespace across kernel restarts and session resume. */
 	snapshot?: KernelSnapshotConfig;
@@ -149,6 +167,13 @@ export interface ExecuteOptions {
 	maxOutputChars?: number;
 	/** Synthetic host cell (snapshot/restore/list); excluded from lastCellCode attribution. */
 	internal?: boolean;
+	/**
+	 * Session that issued this cell, when it is not the kernel's provisioning
+	 * owner (shared kernels). Host requests raised by the cell dispatch to that
+	 * session's handlers via {@link KernelManagerOptions.sessionHostHandlers}.
+	 * Omitted/unknown means the owner's handlers, today's behavior.
+	 */
+	ownerSessionId?: string;
 }
 
 /** MIME tag the `edit` skill emits diff payloads under. */

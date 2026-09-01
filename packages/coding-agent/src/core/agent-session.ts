@@ -10233,6 +10233,31 @@ export class AgentSession {
 		return { model };
 	}
 
+	/**
+	 * Route host requests raised by this child's executions on THIS session's
+	 * kernel back to the child's own handlers. On the kernel-fulfill path
+	 * (extensions adopting the shared kernel), a child's cells execute on the
+	 * parent's kernel; without per-session dispatch, identity-bearing host
+	 * requests (agent_message.send, rlm.run) ran through the parent's handlers
+	 * and acted as the parent. Executions tagged with the child's session id
+	 * (ExecuteOptions.ownerSessionId) now dispatch to the child's handlers.
+	 *
+	 * The provider is liveness-checked through a WeakRef: once the child is
+	 * disposed or collected, dispatch falls back to the owner's handlers, so no
+	 * explicit unregistration is required on the many child-teardown paths.
+	 * Children retained for follow-up messaging stay resolvable.
+	 */
+	private _registerRlmChildKernelHostHandlers(child: AgentSession): void {
+		const provisioner = this._ipythonKernelProvisioner;
+		if (!provisioner) return;
+		const ref = new WeakRef(child);
+		provisioner.registerSessionHostHandlers(child.sessionId, () => {
+			const session = ref.deref();
+			if (!session || session._disposed || session._disposing) return undefined;
+			return session._createKernelHostHandlers();
+		});
+	}
+
 	private async _startRlmChildRun(
 		prompt: string,
 		kwargs: Record<string, unknown> = {},
@@ -10401,6 +10426,7 @@ export class AgentSession {
 				if (run.status === "cancelled") throw new Error(run.error ?? "RLM child cancelled");
 				if (child.sessionName !== sessionName) child.setSessionName(sessionName);
 				publishChildSession(child);
+				this._registerRlmChildKernelHostHandlers(child);
 				throwIfCancelled();
 				run.status = "running";
 				emitChildUpdate();
