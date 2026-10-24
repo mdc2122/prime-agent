@@ -200,17 +200,30 @@ async fn stop_target_within(
     // first, then verify the pid still names our process, and only then
     // does any signal ride the held fd (a signal through this fd can
     // reach the pinned process and nothing else, ever).
-    let Ok(pidfd) = pa_core::platform::process::open_pidfd(target.pid) else {
-        // The kernel-held handle is unavailable (an unsupported platform,
-        // an old kernel, or a process that just exited): the conservative
-        // default never signals - a missed reap is recoverable, a wrong
-        // one is not. A LIVE process behind an unobtainable handle is NOT
-        // gone: the terminal stop keeps its tombstoned descriptor (the
-        // next boot retries), never deletes it behind a false AlreadyGone.
-        if identity_current(target) && crate::lease::is_process_alive(target.pid).unwrap_or(false) {
-            return ReapOutcome::Survived;
+    let pidfd = match pa_core::platform::process::open_pidfd(target.pid) {
+        Ok(pidfd) => pidfd,
+        // No pidfd on this platform (macOS, the BSDs) or kernel: the
+        // escalation falls back to plain kill(2), gated on the identity
+        // check immediately before each signal. Without it a worker that
+        // missed its routed shutdown was never signaled on these platforms
+        // and kept running (and acting) after its stop.
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+            return stop_target_by_pid(target, term_grace, kill_verify).await;
         }
-        return ReapOutcome::AlreadyGone;
+        // The kernel-held handle is unavailable for another reason (a
+        // process that just exited): the conservative default never
+        // signals - a missed reap is recoverable, a wrong one is not. A
+        // LIVE process behind an unobtainable handle is NOT gone: the
+        // terminal stop keeps its tombstoned descriptor (the next boot
+        // retries), never deletes it behind a false AlreadyGone.
+        Err(_) => {
+            if identity_current(target)
+                && crate::lease::is_process_alive(target.pid).unwrap_or(false)
+            {
+                return ReapOutcome::Survived;
+            }
+            return ReapOutcome::AlreadyGone;
+        }
     };
     if !identity_current(target) || !crate::lease::is_process_alive(target.pid).unwrap_or(false) {
         pa_core::platform::process::close_pidfd(pidfd);
@@ -230,6 +243,60 @@ async fn stop_target_within(
     }
     pa_core::platform::process::close_pidfd(pidfd);
     ReapOutcome::Survived
+}
+
+/// The no-pidfd escalation (SIGTERM, grace, SIGKILL, verify) over plain
+/// `kill(2)`. Each signal is sent only right after the identity check
+/// passes (the pid still names the process recorded at discovery, by its
+/// start id), so the recycle window shrinks to the gap between that check
+/// and the syscall. An unverifiable identity (no recorded start id) is
+/// never signaled.
+#[cfg(unix)]
+async fn stop_target_by_pid(
+    target: &ReapTarget,
+    term_grace: Duration,
+    kill_verify: Duration,
+) -> ReapOutcome {
+    use pa_core::platform::process::{kill_pid, Signal};
+    let Ok(pid) = i32::try_from(target.pid) else {
+        return ReapOutcome::Survived;
+    };
+    let alive = || crate::lease::is_process_alive(target.pid).unwrap_or(false);
+    // The pidfd arm's gate, verbatim: a recycled or unverifiable identity
+    // is never signaled (the caller tells an unverifiable live pid apart).
+    if !identity_current(target) || !alive() {
+        return ReapOutcome::AlreadyGone;
+    }
+    if kill_pid(pid, Signal::Term) {
+        if await_gone(target, term_grace).await {
+            return ReapOutcome::Term;
+        }
+        if identity_current(target)
+            && kill_pid(pid, Signal::Kill)
+            && await_gone(target, kill_verify).await
+        {
+            return ReapOutcome::Kill;
+        }
+    }
+    if identity_current(target) && alive() {
+        ReapOutcome::Survived
+    } else {
+        ReapOutcome::AlreadyGone
+    }
+}
+
+/// No signals on this platform: a live process survives the escalation.
+#[cfg(not(unix))]
+async fn stop_target_by_pid(
+    target: &ReapTarget,
+    _term_grace: Duration,
+    _kill_verify: Duration,
+) -> ReapOutcome {
+    if identity_current(target) && crate::lease::is_process_alive(target.pid).unwrap_or(false) {
+        ReapOutcome::Survived
+    } else {
+        ReapOutcome::AlreadyGone
+    }
 }
 
 /// Poll until the identity-gated pid is gone or the budget runs out.
@@ -1030,5 +1097,77 @@ mod tests {
             &interactive,
             "/tmp/sock/daemon.sock"
         ));
+    }
+
+    /// Kills and reaps a spawned child on every exit path of the no-pidfd
+    /// tests below.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    struct KillOnDrop(Option<std::process::Child>);
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    /// No pidfd (macOS): the terminal stop escalation still signals a live,
+    /// identity-verified worker that missed its routed shutdown. Before the
+    /// fix it returned `Survived` without sending any signal, and the worker
+    /// kept running after its stop.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[tokio::test]
+    async fn without_a_pidfd_the_stop_escalation_terminates_the_worker() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut guard = KillOnDrop(Some(
+            std::process::Command::new("sleep")
+                .arg("600")
+                .spawn()
+                .expect("spawn sleep"),
+        ));
+        let pid = guard.0.as_ref().expect("child").id();
+        let start_id = crate::lease::get_process_start_id(pid);
+        assert!(start_id.is_some(), "the identity is observable");
+        let outcome = stop_process(pid, start_id).await;
+        assert_eq!(outcome, ReapOutcome::Term, "sleep exits on SIGTERM");
+        let status = guard
+            .0
+            .take()
+            .expect("child")
+            .wait()
+            .expect("reap the stopped child");
+        assert_eq!(status.signal(), Some(15));
+    }
+
+    /// No pidfd (macOS): a worker that ignores SIGTERM dies to the SIGKILL
+    /// after the grace.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[tokio::test]
+    async fn without_a_pidfd_a_term_ignoring_worker_dies_to_sigkill() {
+        use std::os::unix::process::ExitStatusExt;
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let trap_armed = dir.path().join("trap-armed");
+        let mut guard = KillOnDrop(Some(
+            std::process::Command::new("bash")
+                .arg("-c")
+                .arg("trap '' TERM; : > \"$1\"; while :; do :; done")
+                .arg("bash")
+                .arg(&trap_armed)
+                .spawn()
+                .expect("spawn term-ignoring bash"),
+        ));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !trap_armed.exists() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(trap_armed.exists(), "the trap never armed");
+        let pid = guard.0.as_ref().expect("child").id();
+        let outcome = stop_process(pid, crate::lease::get_process_start_id(pid)).await;
+        assert_eq!(outcome, ReapOutcome::Kill);
+        let status = guard.0.take().expect("child").wait().expect("reap");
+        assert_eq!(status.signal(), Some(9));
     }
 }
