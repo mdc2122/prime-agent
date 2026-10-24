@@ -17,6 +17,34 @@ use crate::protocol::{current_protocol_info, DaemonResponse};
 #[error("supervisor link request timed out")]
 struct LinkTimeout;
 
+/// A `success: false` reply, keeping the typed `errorInfo` the supervisor sent:
+/// a typed refusal such as `worker_overloaded` (the worker is resident and
+/// connected, its in-flight bound is full) must stay distinguishable from a
+/// dead route. Displays as the plain message, so string checks on the error
+/// text ("Unknown active session:") are unchanged.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct LinkRefusal {
+    pub message: String,
+    pub error_info: Option<pa_types::daemon::DaemonErrorInfo>,
+}
+
+impl LinkRefusal {
+    /// Whether an error chain carries the supervisor's typed
+    /// `worker_overloaded` refusal.
+    #[must_use]
+    pub fn is_worker_overloaded(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            cause.downcast_ref::<LinkRefusal>().is_some_and(|refusal| {
+                matches!(
+                    refusal.error_info,
+                    Some(pa_types::daemon::DaemonErrorInfo::WorkerOverloaded)
+                )
+            })
+        })
+    }
+}
+
 /// Marker for write-phase failures: the command never reached the supervisor, so a
 /// transparent reconnect-and-retry is safe.
 #[derive(Debug, thiserror::Error)]
@@ -147,12 +175,12 @@ impl SupervisorLink {
     pub async fn request_success(&self, command: Value, timeout: Duration) -> Result<Value> {
         let response = self.request(command, timeout).await?;
         if !response.success {
-            return Err(anyhow!(
-                "{}",
-                response
+            return Err(anyhow::Error::new(LinkRefusal {
+                message: response
                     .error
-                    .unwrap_or_else(|| "request failed".to_string())
-            ));
+                    .unwrap_or_else(|| "request failed".to_string()),
+                error_info: response.error_info,
+            }));
         }
         Ok(response.data.unwrap_or(Value::Null))
     }

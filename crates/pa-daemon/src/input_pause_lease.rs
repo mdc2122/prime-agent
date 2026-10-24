@@ -25,6 +25,10 @@ pub(crate) struct ClientConnectionState {
     /// The connection's prompt-admission registry (TS `promptAdmissions`
     /// per client): the `prompt`/`prompt_and_wait` admissions.
     pub(crate) prompt_admissions: crate::prompt_admission::PromptAdmissionTable,
+    /// Fires when the connection's read loop ends (EOF, error, or stop):
+    /// pure waits routed for this connection drop with it, so a client that
+    /// gave up never keeps an in-flight permit on the target worker.
+    closed: tokio_util::sync::CancellationToken,
 }
 
 impl ClientConnectionState {
@@ -34,7 +38,25 @@ impl ClientConnectionState {
             pause_epoch: AtomicU64::new(0),
             detaching_sessions: std::sync::Mutex::new(HashSet::new()),
             prompt_admissions: crate::prompt_admission::PromptAdmissionTable::default(),
+            closed: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    /// Mark the connection closed: every wait still routed on its behalf
+    /// is dropped (releasing its worker in-flight permit).
+    pub(crate) fn mark_closed(&self) {
+        self.closed.cancel();
+    }
+
+    /// A drop guard that marks the connection closed on every exit path of
+    /// the connection loop (including early error returns).
+    pub(crate) fn close_on_drop(&self) -> tokio_util::sync::DropGuard {
+        self.closed.clone().drop_guard()
+    }
+
+    /// Resolves once the connection is closed.
+    pub(crate) async fn closed(&self) {
+        self.closed.cancelled().await;
     }
 
     pub(crate) fn connection_id(&self) -> &str {

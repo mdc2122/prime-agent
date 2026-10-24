@@ -360,10 +360,17 @@ impl SupervisorChildSessionsInner {
     /// Whether the child worker still has work in flight (streaming,
     /// queued, or its own children still running - so a child stays
     /// running while any descendant does). `Err` means the child cannot be
-    /// reached right now.
+    /// reached right now. The supervisor's typed `worker_overloaded` refusal
+    /// is not "unreachable": it proves the child's worker is resident and
+    /// connected with its in-flight bound full, i.e. busy.
     pub(super) async fn child_busy(&self, active_session_id: &str) -> Result<bool> {
-        let state = self.child_state(active_session_id).await?;
-        Ok(child_busy_flags(&state))
+        match self.child_state(active_session_id).await {
+            Ok(state) => Ok(child_busy_flags(&state)),
+            Err(error) if crate::supervisor_link::LinkRefusal::is_worker_overloaded(&error) => {
+                Ok(true)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// One `GetLastAssistantText` round trip: the raw text the roster
@@ -400,6 +407,12 @@ impl SupervisorChildSessionsInner {
             id: None,
             active_session_id: active_session_id.to_string(),
             wait_for_rlm_quiescence: Some(true),
+            // The slice budget rides the payload: the supervisor bounds its
+            // route by it and the worker answers when it elapses, so a slice
+            // this side abandons never strands an in-flight permit on the
+            // child's worker (128 stranded slices saturated a busy child and
+            // read as "Child worker unreachable").
+            timeout_ms: Some(budget.as_millis() as u64),
             rest: Map::default(),
         };
         let _ = self

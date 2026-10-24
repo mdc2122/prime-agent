@@ -254,3 +254,51 @@ async fn idle_sessions_admit_the_steering_and_plain_prompt_classes() {
     );
     let _ = std::fs::remove_dir_all(worker.config.recovery_journal_path.parent().unwrap());
 }
+
+/// A caller-budgeted `wait_for_idle` (`timeoutMs`) on a busy session answers
+/// its budget refusal instead of parking until the session next goes
+/// quiescent: the caller (the RLM settle watcher's 60 s slice) has given up,
+/// and a parked waiter outliving it kept the supervisor route - and one of the
+/// worker's in-flight permits - alive.
+#[tokio::test]
+async fn a_budgeted_wait_for_idle_answers_when_its_budget_elapses_on_a_busy_session() {
+    let worker = compaction_admission_worker(json!({})).await;
+    // Let the turn runner park on its empty queues first (its idle pass
+    // clears `busy`), then hold the session busy like a running turn.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    worker.core.lock().unwrap().busy = true;
+    let answered = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        worker.dispatch("wait_for_idle", &json!({ "timeoutMs": 50 })),
+    )
+    .await
+    .expect("a budgeted wait must answer at its budget, not park");
+    assert!(
+        !answered.success,
+        "a busy session is not idle: {answered:?}"
+    );
+    assert_eq!(
+        answered.error.as_deref(),
+        Some(crate::worker::lifecycle::WAIT_FOR_IDLE_BUDGET_ELAPSED)
+    );
+    // An unbudgeted wait keeps its park-until-idle contract.
+    let parked = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        worker.dispatch("wait_for_idle", &json!({})),
+    )
+    .await;
+    assert!(
+        parked.is_err(),
+        "an unbudgeted wait answered on a busy session"
+    );
+    worker.core.lock().unwrap().busy = false;
+    worker.idle_notify.notify_waiters();
+    let idle = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        worker.dispatch("wait_for_idle", &json!({ "timeoutMs": 5_000 })),
+    )
+    .await
+    .expect("an idle session answers a budgeted wait at once");
+    assert!(idle.success, "{idle:?}");
+    let _ = std::fs::remove_dir_all(worker.config.recovery_journal_path.parent().unwrap());
+}

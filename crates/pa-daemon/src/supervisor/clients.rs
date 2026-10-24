@@ -159,6 +159,9 @@ impl Supervisor {
         let roster_subscribed: Arc<std::sync::atomic::AtomicBool> =
             Arc::new(std::sync::atomic::AtomicBool::new(false));
         let connection = Arc::new(crate::input_pause_lease::ClientConnectionState::new());
+        // Every exit of this function (EOF, write error, stop) closes the
+        // connection, dropping the pure waits still routed on its behalf.
+        let _close_guard = connection.close_on_drop();
         // Completed dispatches flow back through this channel so the loop keeps
         // writing: a long command must not block this client's events or its other
         // commands. Bounded so a slow client stalls only its own dispatch tasks.
@@ -303,6 +306,11 @@ impl Supervisor {
                 }
             }
         };
+        // The read loop ended: the client can no longer receive any answer, so the
+        // pure waits routed for it (wait_for_idle / wait_for_headless_completion) drop
+        // now and release their worker in-flight permits instead of parking until the
+        // target session next goes quiescent (up to the 24 h route budget).
+        connection.mark_closed();
         // Only the connection that accepted the shutdown may run the stop pass from this
         // fallback: another client disconnecting in the response window must not preempt the
         // acknowledgement. Every exit path lands here, including the write failures.
@@ -1113,6 +1121,39 @@ impl Supervisor {
                 )
                 .await
             }
+            command
+                if is_disconnect_cancellable_wait(command)
+                    && self.wait_target_is_resident(command).await =>
+            {
+                // A pure wait on a live resident has no side effect to protect:
+                // when the client disconnects, the route future drops, which
+                // releases the worker in-flight permit and the pending reply slot.
+                // (A wait that must first wake a passivated session takes the
+                // plain arm below, so a disconnect never interrupts a wake.)
+                let client_id = effective_client_id.lock().unwrap().clone();
+                let route = self.route_client_command(
+                    command,
+                    &client_id,
+                    attached,
+                    command_id.clone(),
+                    type_name.clone(),
+                    Some(stream),
+                );
+                tokio::select! {
+                    outcome = route => outcome,
+                    () = connection.closed() => {
+                        (
+                            vec![response_line(&response_failure(
+                                Some(&command_id),
+                                &type_name,
+                                CLIENT_DISCONNECTED_WAIT_DROPPED,
+                                None,
+                            ))],
+                            false,
+                        )
+                    }
+                }
+            }
             command => {
                 let client_id = effective_client_id.lock().unwrap().clone();
                 self.route_client_command(
@@ -1127,6 +1168,27 @@ impl Supervisor {
             }
         }
     }
+
+    /// Whether a wait's target session is resident right now (no wake needed).
+    async fn wait_target_is_resident(&self, command: &DaemonCommand) -> bool {
+        match crate::protocol::command_active_session_id(command) {
+            Some(selector) if !selector.is_empty() => self.registry.resolve(selector).await.is_ok(),
+            _ => false,
+        }
+    }
+}
+
+/// The answer a dropped wait carries (never delivered: its client is gone).
+pub(crate) const CLIENT_DISCONNECTED_WAIT_DROPPED: &str =
+    "Client disconnected; the wait was dropped";
+
+/// Commands that only wait and read: dropping them mid-route has no side effect,
+/// so they are dropped when their client connection closes.
+pub(crate) fn is_disconnect_cancellable_wait(command: &DaemonCommand) -> bool {
+    matches!(
+        command,
+        DaemonCommand::WaitForIdle { .. } | DaemonCommand::WaitForHeadlessCompletion { .. }
+    )
 }
 
 #[cfg(all(test, unix))]
