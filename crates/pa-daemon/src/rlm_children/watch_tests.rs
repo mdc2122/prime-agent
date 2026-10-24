@@ -30,7 +30,21 @@ enum FakeChild {
     /// Unreachable; the watcher's give-up poll parks until the test
     /// lands a reader's verdict.
     UnreachableUntilVerdict,
+    /// Alive but route-saturated: `get_state` and `wait_for_idle` answer
+    /// the supervisor's real typed `worker_overloaded` refusal (built by
+    /// `backpressure::overloaded_response`) until the child has seen
+    /// `clears_after_state_reads` state reads; then it is healthy.
+    Overloaded {
+        clears_after_state_reads: u32,
+    },
 }
+
+/// Counters of the `Overloaded` fake (its tests run one at a time under a
+/// paused clock, each resetting them first).
+static OVERLOADED_STATE_READS: AtomicU32 = AtomicU32::new(0);
+static OVERLOADED_REFUSALS: AtomicU32 = AtomicU32::new(0);
+/// Serializes the `Overloaded` tests (they share the counters above).
+static OVERLOADED_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A scripted JSONL supervisor for the watcher tests: creates one child
 /// session, reports it idle with a final answer, and captures the
@@ -98,7 +112,27 @@ async fn spawn_fake_supervisor(
                     let id = value["id"].as_str().unwrap_or_default().to_string();
                     let command = value["command"].clone();
                     let command_type: &str = command["type"].as_str().unwrap_or_default();
+                    let overloaded = match child {
+                        FakeChild::Overloaded {
+                            clears_after_state_reads,
+                        } if matches!(command_type, "get_state" | "wait_for_idle") => {
+                            let reads = if command_type == "get_state" {
+                                OVERLOADED_STATE_READS.fetch_add(1, Ordering::SeqCst) + 1
+                            } else {
+                                OVERLOADED_STATE_READS.load(Ordering::SeqCst)
+                            };
+                            reads <= clears_after_state_reads
+                        }
+                        _ => false,
+                    };
                     let response = match command_type {
+                        _ if overloaded => {
+                            OVERLOADED_REFUSALS.fetch_add(1, Ordering::SeqCst);
+                            let mut refusal =
+                                crate::backpressure::overloaded_response(command_type, "w-child");
+                            refusal.id = Some(id.clone());
+                            refusal
+                        }
                         _ if matches!(
                             (child, command_type),
                             (FakeChild::PromptFails, "prompt")
@@ -1063,4 +1097,77 @@ fn an_already_settled_child_never_re_scores_as_an_unreachable_error() {
     let mut noticed = base();
     noticed.notice_delivered = true;
     assert!(!super::lifecycle::should_mark_unreachable_error(&noticed));
+}
+
+/// Run the watcher against a child whose worker answers the typed
+/// `worker_overloaded` refusal for its first `clears_after_state_reads` state
+/// reads; returns the first parent notice, if one lands within `within`.
+async fn run_overloaded_child(
+    clears_after_state_reads: u32,
+    within: Duration,
+) -> (Option<Value>, tokio::sync::MutexGuard<'static, ()>) {
+    let serialized = OVERLOADED_TESTS.lock().await;
+    OVERLOADED_STATE_READS.store(0, Ordering::SeqCst);
+    OVERLOADED_REFUSALS.store(0, Ordering::SeqCst);
+    // A paused clock auto-advances to the next timer while a real-socket
+    // round trip is in flight; a 1 s ticker keeps those jumps small, so no
+    // request budget (30 s state reads) elapses spuriously.
+    let ticker = tokio::spawn(async {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+        }
+    });
+    let (follow_up_tx, mut follow_up_rx) = mpsc::unbounded_channel();
+    let (sessions, _kill_rx) = sessions_with_fake_supervisor(
+        follow_up_tx,
+        0,
+        FakeKill::Success,
+        FakeChild::Overloaded {
+            clears_after_state_reads,
+        },
+    )
+    .await;
+    let _handle = spawn_child(&sessions).await;
+    sessions.notify_turn_done();
+    let notice = tokio::time::timeout(within, follow_up_rx.recv())
+        .await
+        .ok()
+        .flatten();
+    ticker.abort();
+    (notice, serialized)
+}
+
+/// A live child whose worker route is saturated (every client request
+/// answers the typed `worker_overloaded` refusal) is busy, not dead: past the
+/// whole unreachable give-up window (150 polls) it is never declared
+/// "Child worker unreachable". Before the fix it was, after 150 refusals.
+#[tokio::test(start_paused = true)]
+async fn a_saturated_live_child_is_never_declared_unreachable() {
+    let (notice, _serialized) = run_overloaded_child(u32::MAX, Duration::from_secs(3_600)).await;
+    assert!(
+        OVERLOADED_REFUSALS.load(Ordering::SeqCst) > 3 * WATCH_MAX_UNREACHABLE_POLLS,
+        "the watcher kept polling through the saturation"
+    );
+    if let Some(notice) = notice {
+        panic!("a saturated-but-alive child got a terminal notice: {notice}");
+    }
+}
+
+/// The saturation outlasts the give-up window, then clears and the child goes
+/// idle: it settles with its ordinary no-reply notice, never the unreachable
+/// failure row (which it got before the fix, mid-saturation).
+#[tokio::test(start_paused = true)]
+async fn a_child_whose_saturation_clears_settles_done() {
+    let (notice, _serialized) = run_overloaded_child(
+        2 * WATCH_MAX_UNREACHABLE_POLLS + 40,
+        Duration::from_secs(3_600),
+    )
+    .await;
+    let notice = notice.expect("a notice once the saturation clears");
+    assert_eq!(
+        notice["customMessage"]["content"],
+        "[child-exited: no-reply child:f20-worker]\n\nLast assistant text: the child final answer",
+        "a saturated-but-alive child must not be declared unreachable"
+    );
 }

@@ -562,6 +562,12 @@ pub enum DaemonCommand {
         /// (the `wait_for_headless_completion` barrier of the same name).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wait_for_rlm_quiescence: Option<bool>,
+        /// Caller's wait budget. When set, the supervisor bounds the route by
+        /// it (instead of the 24 h turn budget) and the worker answers a
+        /// `wait_for_idle` timeout refusal when it elapses, so a caller that
+        /// gives up never strands an in-flight permit on the target worker.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
         #[serde(flatten)]
         rest: JsonMap,
     },

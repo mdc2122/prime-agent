@@ -35,12 +35,61 @@ pub(super) async fn fail_unsent_request(resident: &Arc<ResidentWorker>, request_
         )));
     }
 }
+/// Removes a route's pending reply slot when the route future is dropped before
+/// its reply arrived (a cancelled client wait); idempotent with the explicit
+/// removals on the timeout and unsent paths.
+struct PendingSlotGuard {
+    resident: Arc<ResidentWorker>,
+    request_id: String,
+    armed: bool,
+}
+
+impl Drop for PendingSlotGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(mut pending) = self.resident.pending.try_lock() {
+            pending.remove(&self.request_id);
+            return;
+        }
+        // Contended: finish the removal off the drop path.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let resident = Arc::clone(&self.resident);
+            let request_id = std::mem::take(&mut self.request_id);
+            handle.spawn(async move {
+                resident.pending.lock().await.remove(&request_id);
+            });
+        }
+    }
+}
+
 /// TS daemon-supervisor.ts:204 `WORKER_REQUEST_TIMEOUT_MS`.
 pub(crate) const WORKER_REQUEST_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 
+/// Slack the supervisor route keeps past a caller-budgeted `wait_for_idle`, so
+/// the worker's own budget refusal (which also drops its parked waiter)
+/// normally answers before the route deadline does.
+pub(crate) const BUDGETED_WAIT_ROUTE_GRACE_MS: u64 = 2_000;
+
 /// The route budget of a client command: turn-long waits ride TS's 24 h
-/// worker-request budget; everything else is a short control route.
+/// worker-request budget; everything else is a short control route. A
+/// `wait_for_idle` that names its own `timeoutMs` is bounded by it: the
+/// caller abandons the wait at that budget, and a route that outlived its
+/// caller would hold one of the worker's in-flight permits until the session
+/// next went quiescent (the RLM settle watcher re-slices every 60 s, so a
+/// child busy for ~128 slices saturated its worker and was misreported as
+/// "Child worker unreachable").
 pub(crate) fn client_route_timeout(command: &DaemonCommand) -> u64 {
+    if let DaemonCommand::WaitForIdle {
+        timeout_ms: Some(budget),
+        ..
+    } = command
+    {
+        return budget
+            .saturating_add(BUDGETED_WAIT_ROUTE_GRACE_MS)
+            .min(WORKER_REQUEST_TIMEOUT_MS);
+    }
     if matches!(
         command,
         DaemonCommand::PromptAndWait { .. }
@@ -132,6 +181,13 @@ impl Supervisor {
             .lock()
             .await
             .insert(request_id.clone(), reply_tx);
+        // A route future dropped mid-wait (its client disconnected) must not
+        // leave its reply slot in the pending map until the worker answers.
+        let mut pending_slot = PendingSlotGuard {
+            resident: Arc::clone(resident),
+            request_id: request_id.clone(),
+            armed: true,
+        };
         // A full channel means the writer pump is wedged: client commands answer the same
         // overload refusal (a cancelled send enqueues nothing, so a retry cannot duplicate).
         let request = WorkerRequest {
@@ -171,7 +227,12 @@ impl Supervisor {
                 }
             }
         }
-        match tokio::time::timeout_at(deadline, reply_rx).await {
+        let outcome = tokio::time::timeout_at(deadline, reply_rx).await;
+        if matches!(outcome, Ok(Ok(_))) {
+            // The reader already took the slot to deliver this reply.
+            pending_slot.armed = false;
+        }
+        match outcome {
             // The writer pump resolves provably-unsent requests with the not-connected
             // failure: surface it as the retryable route error, not a worker response.
             Ok(Ok(WorkerReply::Typed(response)))

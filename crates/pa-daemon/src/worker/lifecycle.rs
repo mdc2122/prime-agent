@@ -6,6 +6,11 @@ use super::{
     Worker, SIDE_QUESTION_SETTLE_TIMEOUT,
 };
 
+/// The refusal a caller-budgeted `wait_for_idle` answers when its `timeoutMs`
+/// elapses before the session went quiescent.
+pub(crate) const WAIT_FOR_IDLE_BUDGET_ELAPSED: &str =
+    "wait_for_idle budget elapsed before the session went idle";
+
 impl Worker {
     /// `update_snapshot` (supervisor plane, update flow spec §8): a read-only
     /// capture; the queue lanes persist BEFORE replying, so the reported queue
@@ -591,8 +596,25 @@ impl Worker {
     /// (the parent-side settle watcher and `collect` wait out a child's
     /// whole subtree this way).
     pub(crate) async fn handle_wait_for_idle(&self, payload: &Value) -> DaemonResponse {
-        self.wait_until_quiescent(payload).await;
-        response_success(None, "wait_for_idle", None)
+        // A caller-budgeted wait (`timeoutMs`) answers a refusal when the
+        // budget elapses instead of parking until the session next goes
+        // quiescent: the caller has already given up, and the parked waiter
+        // would otherwise outlive it.
+        let Some(budget) = payload.get("timeoutMs").and_then(Value::as_u64) else {
+            self.wait_until_quiescent(payload).await;
+            return response_success(None, "wait_for_idle", None);
+        };
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(budget),
+            self.wait_until_quiescent(payload),
+        )
+        .await
+        {
+            Ok(()) => response_success(None, "wait_for_idle", None),
+            Err(_elapsed) => {
+                response_failure(None, "wait_for_idle", WAIT_FOR_IDLE_BUDGET_ELAPSED, None)
+            }
+        }
     }
 
     /// `wait_for_headless_completion` (TS daemon command): settle the

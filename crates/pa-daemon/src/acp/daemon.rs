@@ -872,6 +872,9 @@ async fn stop_session_work(
         id: None,
         active_session_id: daemon_session_id.to_string(),
         wait_for_rlm_quiescence: None,
+        // Bounded just under the link's own response timeout, so a stop
+        // that gives up never leaves a permit-holding wait behind it.
+        timeout_ms: Some(REQUEST_TIMEOUT.as_millis() as u64 - 1_000),
         rest: Map::default(),
     })
     .await?;

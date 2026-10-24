@@ -30,6 +30,8 @@ mod handshake_tests;
 mod spawn_record_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, unix))]
+mod wait_permit_tests;
 
 // Read only by this facade's in-file tests; the lib-target import is flagged unused.
 #[allow(unused_imports)]
