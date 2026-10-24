@@ -102,6 +102,12 @@ pub(crate) struct ResidentWorker {
     /// The worker's in-flight permits (held until each reply resolves): a client command that finds
     /// this empty is refused with the typed overload error; supervisor-internal routes wait.
     pub(crate) inflight: Arc<tokio::sync::Semaphore>,
+    /// Reserved liveness-probe permits ([`crate::backpressure::WORKER_PROBE_CAPACITY`]):
+    /// a client `get_state` falls back to these when `inflight` is full.
+    pub(crate) probe: Arc<tokio::sync::Semaphore>,
+    /// Reserved teardown permits ([`crate::backpressure::WORKER_CONTROL_CAPACITY`]):
+    /// `kill` and `shutdown` ride these, never an in-flight permit.
+    pub(crate) control: Arc<tokio::sync::Semaphore>,
     pub(crate) pending: Mutex<HashMap<String, tokio::sync::oneshot::Sender<WorkerReply>>>,
     pub(crate) intentional_stop: AtomicBool,
     pub(crate) consecutive_failures: AtomicU32,
@@ -168,6 +174,12 @@ impl ResidentWorker {
             cmd_tx: Mutex::new(None),
             inflight: Arc::new(tokio::sync::Semaphore::new(
                 crate::backpressure::WORKER_INFLIGHT_CAPACITY,
+            )),
+            probe: Arc::new(tokio::sync::Semaphore::new(
+                crate::backpressure::WORKER_PROBE_CAPACITY,
+            )),
+            control: Arc::new(tokio::sync::Semaphore::new(
+                crate::backpressure::WORKER_CONTROL_CAPACITY,
             )),
             pending: Mutex::new(HashMap::new()),
             intentional_stop: AtomicBool::new(false),

@@ -14,6 +14,25 @@ use crate::protocol::{response_failure, DaemonResponse};
 /// enqueue). Codex's `CHANNEL_CAPACITY = 128` for its one-process daemon.
 pub(crate) const WORKER_INFLIGHT_CAPACITY: usize = 128;
 
+/// Reserved permits for read-only liveness probes (`get_state`) once the
+/// in-flight bound is full: a saturated but live worker still answers "what
+/// is your state?", so a watcher can tell busy from wedged without needing
+/// an in-flight slot. A probe that finds the worker's queue full waits inside
+/// its own budget instead of being refused, so a worker that stopped reading
+/// its socket reads as a timeout (unreachable), never as busy.
+pub(crate) const WORKER_PROBE_CAPACITY: usize = 4;
+
+/// Reserved permits for teardown control frames (`kill`, `shutdown`): a
+/// saturated worker can always be told to stop, and the stop never waits on
+/// a client's in-flight slot.
+pub(crate) const WORKER_CONTROL_CAPACITY: usize = 2;
+
+/// The bound of the supervisor-to-worker command channel: every admitted
+/// frame (in-flight, probe and control lanes) fits, so admission still
+/// precedes enqueue and only a wedged writer pump fills the queue.
+pub(crate) const WORKER_COMMAND_QUEUE_CAPACITY: usize =
+    WORKER_INFLIGHT_CAPACITY + WORKER_PROBE_CAPACITY + WORKER_CONTROL_CAPACITY;
+
 /// Capacity of the supervisor's shared client event broadcast ring: the
 /// per-receiver drop on lag is the defined backpressure for a slow reader.
 pub(crate) const EVENT_RING_CAPACITY: usize = 4096;
@@ -40,9 +59,33 @@ pub(crate) enum RouteAdmission {
     /// A client's request-shaped command: answers the typed `worker_overloaded` refusal
     /// the moment the worker saturates (never queued, so the retry cannot duplicate it).
     ClientRequest,
-    /// Supervisor-internal traffic (stop/kill, create replay, cleanup, polls): waits
+    /// A client's read-only liveness probe (`get_state`): an in-flight permit
+    /// when one is free, else one of the [`WORKER_PROBE_CAPACITY`] reserved
+    /// probe permits; refused with `worker_overloaded` only when both are
+    /// full. A full queue is waited out inside the budget (a wedged pump is
+    /// a timeout, not an overload).
+    ClientProbe,
+    /// Supervisor-internal traffic (create replay, cleanup, polls): waits
     /// for a slot inside its own timeout budget — never refused.
     SupervisorInternal,
+    /// Teardown control frames (`kill`, `shutdown`): one of the
+    /// [`WORKER_CONTROL_CAPACITY`] reserved control permits, never an
+    /// in-flight one, so a saturated worker can still be stopped. Waits for
+    /// a control permit inside its budget; never refused.
+    Control,
+}
+
+impl RouteAdmission {
+    /// The admission a routed frame actually rides: teardown frames
+    /// (`kill`, `shutdown`) always take the control lane, whatever lane
+    /// their caller named, so no stop path can queue behind a saturated
+    /// in-flight bound.
+    pub(crate) fn for_command(self, command_type: &str) -> Self {
+        match (self, command_type) {
+            (Self::SupervisorInternal | Self::ClientRequest, "kill" | "shutdown") => Self::Control,
+            (admission, _) => admission,
+        }
+    }
 }
 
 /// The saturated-route refusal a client command answers: typed `worker_overloaded` on

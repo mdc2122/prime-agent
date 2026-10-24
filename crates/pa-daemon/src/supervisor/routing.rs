@@ -143,7 +143,10 @@ impl Supervisor {
         admission: RouteAdmission,
     ) -> Result<WorkerReply> {
         // Bounded admission: a client request answers the overload refusal when the bound is
-        // full; internal traffic waits for a slot inside the budget.
+        // full; internal traffic waits for a slot inside the budget. Teardown frames ride
+        // their own reserved control lane, and a client liveness probe falls back to the
+        // reserved probe lane, so neither ever depends on a free in-flight permit.
+        let admission = admission.for_command(command_type);
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
         // The semaphore methods take their Arc by value (the permit owns it for its
         // lifetime), so the route hands them a strong reference of their own.
@@ -158,8 +161,25 @@ impl Supervisor {
                     ));
                 }
             },
-            RouteAdmission::SupervisorInternal => {
-                match tokio::time::timeout_at(deadline, inflight.acquire_owned()).await {
+            RouteAdmission::ClientProbe => match inflight
+                .try_acquire_owned()
+                .or_else(|_saturated| Arc::clone(&resident.probe).try_acquire_owned())
+            {
+                Ok(permit) => permit,
+                Err(_saturated) => {
+                    self.note_daemon_event("worker_overloaded", None);
+                    return Ok(WorkerReply::Typed(
+                        crate::backpressure::overloaded_response(command_type, &resident.worker_id),
+                    ));
+                }
+            },
+            RouteAdmission::SupervisorInternal | RouteAdmission::Control => {
+                let lane = if matches!(admission, RouteAdmission::Control) {
+                    Arc::clone(&resident.control)
+                } else {
+                    inflight
+                };
+                match tokio::time::timeout_at(deadline, lane.acquire_owned()).await {
                     Ok(Ok(permit)) => permit,
                     // Both remaining shapes are budget exhaustion: the wait elapsed, or the
                     // semaphore closed with its resident.
@@ -171,7 +191,11 @@ impl Supervisor {
         // retire-then-release order of the idle passivation fence): the
         // check runs after admission, so a route that passed readiness
         // before the retire cannot enqueue behind it.
-        if matches!(admission, RouteAdmission::ClientRequest) && resident.route_state().retired {
+        if matches!(
+            admission,
+            RouteAdmission::ClientRequest | RouteAdmission::ClientProbe
+        ) && resident.route_state().retired
+        {
             return Err(anyhow!(WORKER_NOT_CONNECTED));
         }
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -212,7 +236,12 @@ impl Supervisor {
                         crate::backpressure::overloaded_response(command_type, &resident.worker_id),
                     ));
                 }
-                RouteAdmission::SupervisorInternal => {
+                // A probe or a control frame waits out a full queue inside its
+                // budget: a pump that never drains is a timeout (unreachable), not
+                // a busy worker.
+                RouteAdmission::ClientProbe
+                | RouteAdmission::SupervisorInternal
+                | RouteAdmission::Control => {
                     match tokio::time::timeout_at(deadline, cmd_tx.send(unsent)).await {
                         Ok(Ok(())) => {}
                         Ok(Err(_channel_closed)) => {
@@ -664,9 +693,13 @@ impl Supervisor {
             }
         }
         // `Kill` is the one client command with a durable pre-route side effect (its stop
-        // tombstone), so it rides the never-refused control admission.
+        // tombstone), so it rides the never-refused control admission: its own reserved
+        // lane, so a worker whose in-flight bound is full can still be killed. `GetState`
+        // is the read-only liveness probe: a saturated but live worker still answers it
+        // from the reserved probe lane, so "busy" and "wedged" stay distinguishable.
         let admission = match command {
-            DaemonCommand::Kill { .. } => RouteAdmission::SupervisorInternal,
+            DaemonCommand::Kill { .. } => RouteAdmission::Control,
+            DaemonCommand::GetState { .. } => RouteAdmission::ClientProbe,
             _ => RouteAdmission::ClientRequest,
         };
         // TS daemon-supervisor's `routeClientCommand` wraps the live

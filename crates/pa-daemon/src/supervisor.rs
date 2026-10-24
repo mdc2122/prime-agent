@@ -26,6 +26,8 @@ mod supervision;
 
 #[cfg(test)]
 mod handshake_tests;
+#[cfg(all(test, unix))]
+mod liveness_lane_tests;
 #[cfg(test)]
 mod spawn_record_tests;
 #[cfg(test)]

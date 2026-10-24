@@ -77,6 +77,28 @@ const WATCH_POLL_INTERVAL_MS: u64 = 2_000;
 /// Failed worker polls before settling an unreachable child as errored;
 /// roster reads never run their own worker recovery.
 const WATCH_MAX_UNREACHABLE_POLLS: u32 = 150;
+/// Failed liveness probes that each ran into their budget (no answer at
+/// all, as opposed to an instant refusal) before settling the child as
+/// unreachable. A dead worker fails each probe at once and trips
+/// [`WATCH_MAX_UNREACHABLE_POLLS`] (~5 min); a frozen one (stopped, or no
+/// longer reading its socket) fails each probe only at its 30 s budget, so
+/// 150 polls would take ~5 h. One such pass costs at most the idle slice,
+/// two state reads and the poll interval (~2 min), so this bounds the
+/// frozen case at ~10 min, and a live worker answers its probe from the
+/// reserved probe lane however busy it is.
+const WATCH_MAX_TIMED_OUT_POLLS: u32 = 5;
+/// A failed probe that took at least this long ran into its budget (see
+/// [`WATCH_MAX_TIMED_OUT_POLLS`]).
+const WATCH_TIMED_OUT_PROBE_MS: u64 = STATE_TIMEOUT_MS / 2;
+/// Wall-clock bound on one unbroken streak with no real answer from the
+/// child (typed `worker_overloaded` refusals, mixed with failed probes). A
+/// saturated but live worker answers its liveness probe from the reserved
+/// probe lane, so an overload refusal on the probe itself means the
+/// in-flight bound AND the probe lane stayed full; that is tolerated as
+/// busy for this long (well past the old ~5 min give-up, so a burst of
+/// concurrent probers never trips it), then settled as unreachable (a
+/// worker whose route stays refused must not be watched forever).
+const WATCH_MAX_OVERLOADED_MS: u64 = 90 * 60 * 1000;
 
 /// How long a follow-up usage watcher waits for the child's turn to start
 /// before retiring; an unpicked delivery attributes nothing.
