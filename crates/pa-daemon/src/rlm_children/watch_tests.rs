@@ -50,6 +50,11 @@ enum FakeChild {
     Overloaded {
         clears_after_state_reads: u32,
     },
+    /// Frozen: the worker took the task prompt, then stopped answering
+    /// (a stopped process, or one that no longer reads its socket):
+    /// `get_state` and `wait_for_idle` are never answered, so every probe
+    /// ends at its link budget instead of failing at once.
+    Frozen,
 }
 
 /// Counters of the `Overloaded` fake (its tests run one at a time under a
@@ -152,6 +157,11 @@ async fn spawn_fake_supervisor(
                         }
                         _ => false,
                     };
+                    if matches!(child, FakeChild::Frozen)
+                        && matches!(command_type, "get_state" | "wait_for_idle")
+                    {
+                        std::future::pending::<()>().await;
+                    }
                     let response = match command_type {
                         _ if overloaded => {
                             OVERLOADED_REFUSALS.fetch_add(1, Ordering::SeqCst);
@@ -2825,4 +2835,95 @@ async fn a_child_whose_saturation_clears_settles_done() {
         "[child-exited: no-reply child:f20-worker]\n\nLast assistant text: the child final answer",
         "a saturated-but-alive child must not be declared unreachable"
     );
+}
+
+/// A 1 s ticker for the paused-clock watcher tests: the paused clock
+/// auto-advances to the next timer while a real-socket round trip is in
+/// flight, and the ticker keeps those jumps small so no link budget elapses
+/// spuriously.
+fn small_clock_steps() -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+        }
+    })
+}
+
+/// A frozen child worker never answers its liveness probes; each one ends at
+/// its 30 s budget, so 150 polls would take hours (each watcher pass waits
+/// out a 65 s idle slice and two 30 s state reads). Probes that run into
+/// their budget have their own small count: the child is declared
+/// unreachable within ~11 min, and the verdict terminates it (a plain kill)
+/// before the parent is told, so a worker that later thaws cannot keep
+/// acting unseen. Before the fix the verdict took ~5 h of paused time and no
+/// kill was ever sent.
+#[tokio::test(start_paused = true)]
+async fn a_frozen_child_is_declared_unreachable_in_bounded_time_and_killed() {
+    let ticker = small_clock_steps();
+    let (follow_up_tx, mut follow_up_rx) = mpsc::unbounded_channel();
+    let (sessions, mut kill_rx) =
+        sessions_with_fake_supervisor(follow_up_tx, 0, FakeKill::Success, FakeChild::Frozen).await;
+    let handle = spawn_child(&sessions).await;
+    sessions.notify_turn_done();
+    let follow_up = tokio::time::timeout(Duration::from_mins(20), follow_up_rx.recv())
+        .await
+        .expect("a frozen child must be declared unreachable within 20 min")
+        .expect("follow_up channel open");
+    ticker.abort();
+    assert_failure_row(&follow_up, &handle.rlm_child_id, "Child worker unreachable");
+    let kill = kill_rx
+        .try_recv()
+        .expect("the unreachable verdict kills the child before the notice");
+    assert_eq!(kill["activeSessionId"], "child-live");
+    assert!(
+        kill.get("rlmCloseReason").is_none(),
+        "a plain kill (the supervisor stops and escalates), not a cascade marker: {kill}"
+    );
+}
+
+/// The overload tolerance is bounded: a child whose every liveness probe
+/// meets the typed `worker_overloaded` refusal (the in-flight bound AND the
+/// reserved probe lane stayed full, which a live worker does not cause) is
+/// tolerated as busy well past the old 150-poll window, but not forever:
+/// it is declared unreachable and killed once the no-answer streak passes
+/// its 90 min wall-clock bound. Before the fix it was declared unreachable
+/// after 150 refusals (~5 min); with only the classification fix it was
+/// watched forever.
+#[tokio::test(start_paused = true)]
+async fn an_overloaded_streak_past_its_bound_is_declared_unreachable_and_killed() {
+    let _serialized = OVERLOADED_TESTS.lock().await;
+    OVERLOADED_STATE_READS.store(0, Ordering::SeqCst);
+    OVERLOADED_REFUSALS.store(0, Ordering::SeqCst);
+    let ticker = small_clock_steps();
+    let (follow_up_tx, mut follow_up_rx) = mpsc::unbounded_channel();
+    let (sessions, mut kill_rx) = sessions_with_fake_supervisor(
+        follow_up_tx,
+        0,
+        FakeKill::Success,
+        FakeChild::Overloaded {
+            clears_after_state_reads: u32::MAX,
+        },
+    )
+    .await;
+    let handle = spawn_child(&sessions).await;
+    sessions.notify_turn_done();
+    let early = tokio::time::timeout(Duration::from_mins(80), follow_up_rx.recv()).await;
+    if let Ok(notice) = early {
+        panic!("a child refused as overloaded was failed inside 80 min: {notice:?}");
+    }
+    assert!(
+        kill_rx.try_recv().is_err(),
+        "no kill while the overload is tolerated"
+    );
+    let follow_up = tokio::time::timeout(Duration::from_mins(30), follow_up_rx.recv())
+        .await
+        .expect("the overload tolerance is bounded (declared unreachable by 110 min)")
+        .expect("follow_up channel open");
+    ticker.abort();
+    assert_failure_row(&follow_up, &handle.rlm_child_id, "Child worker unreachable");
+    let kill = kill_rx
+        .try_recv()
+        .expect("the unreachable verdict kills the child before the notice");
+    assert_eq!(kill["activeSessionId"], "child-live");
 }

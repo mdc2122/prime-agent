@@ -10,8 +10,9 @@ use super::{
     Mutex, ParentIdentity, Path, PromptInput, Result, RlmChildTerminalNotice,
     SupervisorChildSessionsInner, Value, ANSWER_TEXT_MAX_CHARS, CREATE_TIMEOUT_MS,
     IDLE_WAIT_GRACE_MS, KILL_TIMEOUT_MS, NOTICE_DELIVERY_TIMEOUT_MS, PROMPT_TIMEOUT_MS,
-    RUNTIME_METADATA_PROMPT_MAX, STATE_TIMEOUT_MS, WATCH_MAX_UNREACHABLE_POLLS,
-    WATCH_POLL_INTERVAL_MS, WATCH_SETTLE_GRACE_MS, WATCH_WAIT_SLICE_MS,
+    RUNTIME_METADATA_PROMPT_MAX, STATE_TIMEOUT_MS, WATCH_MAX_OVERLOADED_MS,
+    WATCH_MAX_TIMED_OUT_POLLS, WATCH_MAX_UNREACHABLE_POLLS, WATCH_POLL_INTERVAL_MS,
+    WATCH_SETTLE_GRACE_MS, WATCH_TIMED_OUT_PROBE_MS, WATCH_WAIT_SLICE_MS,
 };
 
 /// Parsed ids of one created child session.
@@ -364,10 +365,24 @@ impl SupervisorChildSessionsInner {
     /// is not "unreachable": it proves the child's worker is resident and
     /// connected with its in-flight bound full, i.e. busy.
     pub(super) async fn child_busy(&self, active_session_id: &str) -> Result<bool> {
+        Ok(match self.child_liveness(active_session_id).await? {
+            ChildLiveness::Answered { busy } => busy,
+            ChildLiveness::Overloaded => true,
+        })
+    }
+
+    /// One liveness probe of the child worker (`get_state`, which the
+    /// supervisor admits on its reserved probe lane when the in-flight bound
+    /// is full): a real answer, or the typed `worker_overloaded` refusal
+    /// (both the in-flight bound and the probe lane full). `Err` is a dead
+    /// route or a probe that got no answer inside its budget.
+    pub(super) async fn child_liveness(&self, active_session_id: &str) -> Result<ChildLiveness> {
         match self.child_state(active_session_id).await {
-            Ok(state) => Ok(child_busy_flags(&state)),
+            Ok(state) => Ok(ChildLiveness::Answered {
+                busy: child_busy_flags(&state),
+            }),
             Err(error) if crate::supervisor_link::LinkRefusal::is_worker_overloaded(&error) => {
-                Ok(true)
+                Ok(ChildLiveness::Overloaded)
             }
             Err(error) => Err(error),
         }
@@ -495,6 +510,12 @@ impl SupervisorChildSessionsInner {
     /// when the child never replied; the watcher stops as soon as the record is removed.
     pub(super) async fn watch_child_settle(&self, record: &Arc<Mutex<ChildRecord>>) {
         let mut unreachable_polls: u32 = 0;
+        // Failed probes of the current streak that ran into their budget
+        // (a frozen worker), as opposed to instant refusals (a dead route).
+        let mut timed_out_polls: u32 = 0;
+        // When the current streak with no real answer began (failed probes
+        // and overload refusals alike; only a real answer breaks it).
+        let mut unanswered_since: Option<tokio::time::Instant> = None;
         loop {
             // The parent closed with this child running: the child dies
             // with it and no notice is owed — end without polling it.
@@ -602,33 +623,80 @@ impl SupervisorChildSessionsInner {
             }
             // Still running (a timed-out slice or a re-queued continuation):
             // re-check liveness so a dead worker cannot spin the watch.
-            let busy = self.child_busy(&active_session_id).await;
-            if busy.is_ok() {
-                unreachable_polls = 0;
-            } else {
-                unreachable_polls += 1;
-                if unreachable_polls >= WATCH_MAX_UNREACHABLE_POLLS {
-                    // A dead child keeps whatever rows its file already
-                    // holds; capture them before the terminal notice.
-                    self.emit_final_child_usage(record).await;
-                    if self
-                        .settle_failed(record, "Child worker unreachable".to_string())
+            // A real answer proves the worker alive. An overload refusal
+            // proves the supervisor still holds a live connection to it, but
+            // not that the worker answers, so it is busy only for a bounded
+            // time. A failed probe is unreachable, bounded by count: instant
+            // failures (a dead route) by the old poll count, probes that ran
+            // into their budget (a frozen worker) by a much smaller one.
+            let probe_started = tokio::time::Instant::now();
+            match self.child_liveness(&active_session_id).await {
+                Ok(ChildLiveness::Answered { .. }) => {
+                    unreachable_polls = 0;
+                    timed_out_polls = 0;
+                    unanswered_since = None;
+                }
+                Ok(ChildLiveness::Overloaded) => {
+                    unreachable_polls = 0;
+                    timed_out_polls = 0;
+                    unanswered_since.get_or_insert(probe_started);
+                }
+                Err(_) => {
+                    unreachable_polls += 1;
+                    if probe_started.elapsed() >= Duration::from_millis(WATCH_TIMED_OUT_PROBE_MS) {
+                        timed_out_polls += 1;
+                    }
+                    unanswered_since.get_or_insert(probe_started);
+                }
+            }
+            let overload_streak_over = unanswered_since.is_some_and(|since| {
+                since.elapsed() >= Duration::from_millis(WATCH_MAX_OVERLOADED_MS)
+            });
+            if unreachable_polls >= WATCH_MAX_UNREACHABLE_POLLS
+                || timed_out_polls >= WATCH_MAX_TIMED_OUT_POLLS
+                || overload_streak_over
+            {
+                // A dead child keeps whatever rows its file already
+                // holds; capture them before the terminal notice.
+                self.emit_final_child_usage(record).await;
+                // The verdict terminates the child before the parent
+                // hears of it: a worker declared unreachable that was
+                // only frozen must not wake up later and keep acting
+                // (pushing, merging) unseen while the parent respawns
+                // its task. The same plain kill the prompt-failure arm
+                // sends; the supervisor's stop escalation signals the
+                // process if the kill frame is never answered. A
+                // verdict a reader already landed keeps its child.
+                let claimable = should_mark_error(&*record.lock().await);
+                if claimable {
+                    if let Err(error) = self
+                        .kill_child(&active_session_id, ChildCloseReason::Killed)
                         .await
                     {
-                        return;
+                        eprintln!(
+                            "pa-daemon: RLM child {active_session_id} unreachable; kill failed: {error:#}"
+                        );
                     }
-                    // The claim lost to a verdict a reader's refresh landed
-                    // after this pass's settle read (the worker answered
-                    // idle, so the dead streak is broken): the settled
-                    // branch owes that verdict its notice and funnel. With
-                    // no verdict left, a cancel or a parent close owns the
-                    // tail.
-                    if record.lock().await.settled_status.is_none() {
-                        return;
-                    }
-                    unreachable_polls = 0;
-                    continue;
                 }
+                if self
+                    .settle_failed(record, "Child worker unreachable".to_string())
+                    .await
+                {
+                    return;
+                }
+                // The claim lost to a verdict a reader's refresh landed
+                // after this pass's settle read (the worker answered
+                // idle, so the dead streak is broken): the settled
+                // branch owes that verdict its notice and funnel. With
+                // no verdict left, a cancel or a parent close owns the
+                // tail.
+                if record.lock().await.settled_status.is_none() {
+                    return;
+                }
+                unreachable_polls = 0;
+                timed_out_polls = 0;
+                unanswered_since = None;
+                continue;
             }
             tokio::time::sleep(Duration::from_millis(WATCH_POLL_INTERVAL_MS)).await;
         }
@@ -867,6 +935,14 @@ impl SupervisorChildSessionsInner {
             );
         }
     }
+}
+
+/// One liveness probe's outcome (see `child_liveness`).
+pub(super) enum ChildLiveness {
+    /// The worker answered its state: alive, busy or not.
+    Answered { busy: bool },
+    /// The supervisor refused the probe with the typed `worker_overloaded`.
+    Overloaded,
 }
 
 /// Whether a child may still settle as an error (the failed task prompt's

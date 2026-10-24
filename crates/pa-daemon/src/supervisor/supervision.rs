@@ -704,10 +704,11 @@ impl Supervisor {
         }
         .with_context(|| format!("connect worker socket {}", socket_path.display()))?;
         let (reader, mut writer) = stream.split();
-        // Bounded at the in-flight capacity (the admission seam in `route_command` refuses
-        // or waits before enqueueing): no unbounded channel on the request path.
+        // Bounded at the admitted capacity, in-flight plus the reserved probe and control
+        // lanes (the admission seam in `route_command` refuses or waits before
+        // enqueueing): no unbounded channel on the request path.
         let (cmd_tx, mut cmd_rx) =
-            mpsc::channel::<WorkerRequest>(crate::backpressure::WORKER_INFLIGHT_CAPACITY);
+            mpsc::channel::<WorkerRequest>(crate::backpressure::WORKER_COMMAND_QUEUE_CAPACITY);
         resident.pending.lock().await.clear();
         let events = self.events.clone();
         // The connection epoch ties both pumps to this connection: only they
